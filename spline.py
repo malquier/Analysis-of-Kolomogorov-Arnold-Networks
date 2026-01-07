@@ -54,6 +54,21 @@ def basis_funs(t: np.ndarray, p: int, s: int, x: float) -> np.ndarray:
     return N
 
 
+def basis_vector(u: float, t: np.ndarray, p: int) -> np.ndarray:
+    """
+    Full basis vector b(u) of length K, with only p+1 non-zeros.
+    """
+    K = len(t) - p - 1
+    u_clamped = min(max(float(u), float(t[p])), float(t[K]))
+    s = find_span(t, p, u_clamped)
+    N = basis_funs(t, p, s, u_clamped)  # shape (p+1,)
+    first = s - p
+
+    b = np.zeros(K, dtype=float)
+    b[first : first + p + 1] = N
+    return b
+
+
 def uniform_clamped_knots(a: float, b: float, n_intervals: int, p: int) -> np.ndarray:
     """
     Open uniform clamped knot vector on [a,b] with n_intervals intervals.
