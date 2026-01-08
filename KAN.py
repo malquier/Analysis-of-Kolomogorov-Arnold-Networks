@@ -1,410 +1,367 @@
-import matplotlib.pyplot as plt
-from spline import *
-from typing import Union
+from __future__ import annotations
 
-LayerParams = tuple[np.ndarray, int, np.ndarray]
+from typing import List, Optional, Sequence, Tuple, Any
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-
-"""
-
------------------------------ Construction of KAN forward -----------------------------
-
-"""
+from spline import uniform_clamped_knots, bspline_basis_matrix
 
 
-def edge_spline_forward(u: float, t: np.ndarray, p: int, c_edge: np.ndarray) -> float:
+class KANLayer(nn.Module):
     """
-    Evaluate one spline edge φ(u) using local B-spline bases.
+    One KAN layer:
+        y_j = sum_i phi_{j,i}(x_i)
+    where each phi_{j,i} is a 1D spline:
+        phi_{j,i}(u) = sum_k c_{j,i,k} B_k(u)
 
-    Parameters
-    ----------
-    u      : scalar input
-    t      : knot vector (clamped), shape (m,)
-    p      : spline degree
-    c_edge : coefficients, shape (K,) where K = m - p - 1
-
-    Returns
-    -------
-    float : φ(u)
+    This implementation:
+      - uses a single shared knot vector `t` for all input dims in the layer
+      - stores coefficients as nn.Parameter of shape (d_out, d_in, K)
+      - computes the **full** basis vector in torch (differentiable w.r.t. x)
+      - forward is vectorized over batch and edges for speed/clarity
     """
-    t = np.asarray(t, dtype=float)
-    c_edge = np.asarray(c_edge, dtype=float)
 
-    if not np.isfinite(u):
-        raise ValueError(f"u must be finite, got {u}")
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        t: torch.Tensor,
+        p: int = 3,
+        init_scale: float = 1e-2,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
 
-    if p < 0:
-        raise ValueError("p must be >= 0")
+        if d_in <= 0 or d_out <= 0:
+            raise ValueError("d_in and d_out must be positive.")
+        if p < 0:
+            raise ValueError("p must be >= 0.")
 
-    K = len(t) - p - 1
-    if K <= 0:
-        raise ValueError(
-            f"Invalid knot vector length for degree p={p}: len(t)={len(t)}"
+        self.d_in = int(d_in)
+        self.d_out = int(d_out)
+        self.p = int(p)
+
+        if not isinstance(t, torch.Tensor):
+            raise TypeError("t must be a torch.Tensor (knot vector)")
+
+        # store knots as a non-trainable buffer so it follows .to(device)
+        t = t.to(device=device, dtype=dtype)
+        self.register_buffer("t", t)
+
+        K = int(self.t.numel() - self.p - 1)
+        if K <= 0:
+            raise ValueError(
+                f"Invalid knot vector length for p={p}: len(t)={int(self.t.numel())}"
+            )
+        self.K = int(K)
+
+        # Trainable spline coefficients per edge (j,i,:)
+        coeffs = init_scale * torch.randn(
+            self.d_out, self.d_in, self.K, device=device, dtype=dtype
+        )
+        self.coeffs = nn.Parameter(coeffs)
+
+        # Optional pruning mask (non-trainable): 1 active, 0 pruned
+        self.register_buffer(
+            "mask", torch.ones(self.d_out, self.d_in, dtype=dtype, device=device)
         )
 
-    if len(c_edge) != K:
-        raise ValueError(f"c_edge has wrong length: got {len(c_edge)}, expected {K}")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: shape (d_in,) or (B, d_in)
+        returns y: shape (d_out,) or (B, d_out)
+        """
+        # Accept (d_in,) or (B, d_in)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+            squeeze_out = True
+        elif x.ndim == 2:
+            squeeze_out = False
+        else:
+            raise ValueError("x must be 1D or 2D tensor.")
 
-    # clamp u into valid domain [t[p], t[K]]
-    u_clamped = min(max(float(u), float(t[p])), float(t[K]))
+        if x.shape[1] != self.d_in:
+            raise ValueError(f"Expected x shape (B,{self.d_in}), got {tuple(x.shape)}")
 
-    # find span
-    s = find_span(t, p, u_clamped)
+        # Build basis matrix per input dimension: (B, d_in, K)
+        B_list = [
+            bspline_basis_matrix(x[:, i], self.t, self.p) for i in range(self.d_in)
+        ]
+        Bx = torch.stack(B_list, dim=1)  # (B, d_in, K)
 
-    # basis values (p+1)
-    N = basis_funs(t, p, s, u_clamped)
+        # Apply pruning mask on edges: (d_out, d_in, 1)
+        C = self.coeffs * self.mask.unsqueeze(-1)
 
-    first = s - p
-    # dot product between active coeffs and active bases
-    return float(np.dot(c_edge[first : first + p + 1], N))
+        # y[b, j] = sum_i sum_k Bx[b,i,k] * C[j,i,k]
+        y = torch.einsum("bik,oik->bo", Bx, C)
 
+        return y.squeeze(0) if squeeze_out else y
 
-def kan_layer_forward(
-    u: np.ndarray, t: np.ndarray, p: int, c_edges: np.ndarray
-) -> np.ndarray:
-    """
-    Forward pass of one KAN layer:
-        y_j = sum_i phi_{j,i}(u_i)
+    # -------------------------
+    # Regularization helpers
+    # -------------------------
+    def l1_coeffs(self) -> torch.Tensor:
+        return torch.sum(torch.abs(self.coeffs) * self.mask.unsqueeze(-1))
 
-    Parameters
-    ----------
-    u       : input vector, shape (d_in,)
-    t       : knot vector, shape (m,)
-    p       : spline degree
-    c_edges : edge coeffs, shape (d_out, d_in, K), with K = len(t) - p - 1
+    def smoothness_penalty(self, diff_order: int = 2) -> torch.Tensor:
+        if diff_order not in (1, 2):
+            raise ValueError("diff_order must be 1 or 2 (extend if needed).")
 
-    Returns
-    -------
-    y : output vector, shape (d_out,)
-    """
+        C = self.coeffs * self.mask.unsqueeze(-1)
 
-    K = len(t) - p - 1
-    d_in = u.shape[0]
-    d_out = c_edges.shape[0]
+        if diff_order == 1:
+            D = C[..., 1:] - C[..., :-1]
+        else:
+            if self.K < 3:
+                return torch.zeros((), device=C.device, dtype=C.dtype)
+            D = C[..., 2:] - 2.0 * C[..., 1:-1] + C[..., :-2]
 
-    if c_edges.shape != (d_out, d_in, K):
-        raise ValueError(
-            f"c_edges has shape {c_edges.shape}, expected {(d_out, d_in, K)}"
-        )
+        return torch.sum(D * D)
 
-    y = np.zeros(d_out, dtype=float)
+    @torch.no_grad()
+    def prune_edges(self, threshold: float) -> None:
+        if threshold < 0:
+            raise ValueError("threshold must be >= 0.")
 
-    for j in range(d_out):
-        acc = 0.0
-        for i in range(d_in):
-            acc += edge_spline_forward(float(u[i]), t, p, c_edges[j, i])
-        y[j] = acc
-
-    return y
+        norms = torch.linalg.norm(self.coeffs, dim=-1)
+        to_prune = norms < threshold
+        self.mask[to_prune] = 0.0
+        self.coeffs[to_prune] = 0.0
 
 
-def kan_forward(
-    x: np.ndarray, network_params: list[LayerParams], return_activations: bool = False
-) -> Union[np.ndarray, tuple[np.ndarray, list[np.ndarray]]]:
-    """
-    Forward pass through a multi-layer KAN.
+class KANNet(nn.Module):
+    def __init__(
+        self,
+        dims: Sequence[int],
+        p: int = 3,
+        n_intervals: int = 20,
+        domains: Optional[Sequence[Tuple[float, float]]] = None,
+        init_scale: float = 1e-2,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
 
-    Parameters
-    ----------
-    x : shape (d0,)
-    network_params : list of layers (t, p, c_edges)
-    return_activations : if True, also returns intermediate activations
+        if len(dims) < 2:
+            raise ValueError("dims must have at least 2 elements (input and output).")
 
-    Returns
-    -------
-    y_hat : shape (dL,)
-    (optional) activations : list of activations including input
-    """
-    h = np.asarray(x, dtype=float)
+        self.dims = list(map(int, dims))
+        self.p = int(p)
+        self.n_intervals = int(n_intervals)
 
-    activations = [h] if return_activations else None
+        L = len(self.dims) - 1
 
-    for t, p, c_edges in network_params:
-        h = kan_layer_forward(h, t, p, c_edges)
+        if domains is None:
+            domains = [(-1.0, 1.0)] * L
+        if len(domains) != L:
+            raise ValueError(f"domains must have length {L} (one per layer).")
+
+        layers: List[KANLayer] = []
+        for l in range(L):
+            a, b = domains[l]
+            t = uniform_clamped_knots(
+                float(a),
+                float(b),
+                n_intervals=self.n_intervals,
+                p=self.p,
+                device=device,
+                dtype=dtype,
+            )
+
+            layer = KANLayer(
+                d_in=self.dims[l],
+                d_out=self.dims[l + 1],
+                t=t,
+                p=self.p,
+                init_scale=init_scale,
+                device=device,
+                dtype=dtype,
+            )
+            layers.append(layer)
+
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor, return_activations: bool = False):
+        h = x
+        activations = [h] if return_activations else None
+
+        for layer in self.layers:
+            h = layer(h)
+            if return_activations:
+                activations.append(h)
+
         if return_activations:
-            activations.append(h)
+            return h, activations
+        return h
 
-    if return_activations:
-        return h, activations
-    return h
+    def regularization(
+        self,
+        lambda_l1: float = 0.0,
+        lambda_smooth: float = 0.0,
+        diff_order: int = 2,
+    ) -> torch.Tensor:
+        reg = torch.zeros(
+            (), device=self.layers[0].coeffs.device, dtype=self.layers[0].coeffs.dtype
+        )
 
+        if lambda_l1 != 0.0:
+            for layer in self.layers:
+                reg = reg + float(lambda_l1) * layer.l1_coeffs()
 
-"""
+        if lambda_smooth != 0.0:
+            for layer in self.layers:
+                reg = reg + float(lambda_smooth) * layer.smoothness_penalty(
+                    diff_order=diff_order
+                )
 
------------------------------ Loss functions -----------------------------
+        return reg
 
-"""
-
-
-def mse(y: np.ndarray, y_hat: np.ndarray) -> float:
-    y = np.asarray(y, dtype=float)
-    y_hat = np.asarray(y_hat, dtype=float)
-    return float(np.mean((y - y_hat) ** 2))
-
-
-def mse_loss(dataset, network_params: list[LayerParams]) -> float:
-    """
-    dataset: iterable of (x, y) where x is (d0,) and y is (dL,)
-    """
-    total = 0.0
-    N = len(dataset)
-    for x, y in dataset:
-        y_hat = kan_forward(x, network_params)
-        total += mse(y, y_hat)
-    return total / N
-
-
-"""
-
------------------------------ KAn for (1,1)-layer -----------------------------
-
-"""
+    @torch.no_grad()
+    def prune(self, threshold: float) -> None:
+        for layer in self.layers:
+            layer.prune_edges(threshold)
 
 
-def predict_kan11(x: np.ndarray, t: np.ndarray, p: int, c: np.ndarray) -> np.ndarray:
-    """
-    Predict y_hat = B(x) @ c without building full B matrix explicitly.
-    """
-    y_estimated = np.zeros_like(x, dtype=float)
-    for n, xn in enumerate(x):
-        b = basis_vector(float(xn), t, p)
-        y_estimated[n] = float(np.dot(b, c))
-    return y_estimated
+def train_kan_from_dataset(
+    model,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    *,
+    X_val: Optional[torch.Tensor] = None,
+    y_val: Optional[torch.Tensor] = None,
+    batch_size: int = 64,
+    epochs: int = 200,
+    lr: float = 3e-2,
+    shuffle: bool = True,
+    lambda_l1: float = 0.0,
+    lambda_smooth: float = 0.0,
+    diff_order: int = 2,
+    device: Optional[torch.device] = None,
+    print_every: int = 20,
+) -> dict[str, Any]:
 
+    if device is None:
+        device = next(model.parameters()).device
 
-def train_kan11_gd(
-    x: np.ndarray,
-    y: np.ndarray,
-    t: np.ndarray,
-    p: int,
-    actualisation_rate: float = 1e-2,
-    n_epochs: int = 200,
-    ridge_lambda: float = 0.0,
-    seed: int = 42,
-):
-    """
-    Gradient descent training for KAN(1,1):
-        y_hat_n = sum_k c_k B_k(x_n)
-        L = mean((y_hat - y)^2) + ridge_lambda * ||c||^2
+    model.to(device)
 
-    Returns:
-        c, losses
-    """
-    rng = np.random.default_rng(seed)
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
 
-    K = len(t) - p - 1
-    c = 0.01 * rng.standard_normal(K)  # small init
+    if y_train.ndim == 1:
+        y_train = y_train.unsqueeze(1)
 
-    losses = []
+    train_ds = TensorDataset(X_train, y_train)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle)
 
-    for _ in range(1, n_epochs + 1):
-        # forward + gradient accumulation
-        grad = np.zeros_like(c)
-        loss = 0.0
+    val_loader = None
+    if X_val is not None and y_val is not None:
+        X_val = X_val.to(device)
+        y_val = y_val.to(device)
+        if y_val.ndim == 1:
+            y_val = y_val.unsqueeze(1)
+        val_ds = TensorDataset(X_val, y_val)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-        for xn, yn in zip(x, y):
-            b = basis_vector(float(xn), t, p)  # (K,)
-            y_estimated = float(np.dot(b, c))
-            err = y_estimated - float(yn)
-            loss += err * err
-            # d/dc mean(err^2) -> (2/N) * err * b
-            grad += err * b
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-        N = len(x)
-        loss = loss / N
-        grad = (2.0 / N) * grad
-
-        # ridge
-        if ridge_lambda > 0.0:
-            loss += ridge_lambda * float(np.dot(c, c))
-            grad += 2.0 * ridge_lambda * c
-
-        # update
-        c -= actualisation_rate * grad
-        losses.append(loss)
-
-    return c, np.array(losses)
-
-
-def train_kan_1_1(
-    x: np.ndarray,
-    y: np.ndarray,
-    p: int = 3,
-    n_intervals: int = 20,
-    t=None,
-    ridge_lambda: float = 0.0,
-) -> tuple[np.ndarray, int, np.ndarray]:
-    """
-    Train a KAN(1,1) (single spline edge) with least squares / ridge.
-
-    Parameters
-    ----------
-    x, y : arrays shape (N,)
-    p : spline degree
-    n_intervals : number of intervals for uniform clamped knots (ignored if t is provided)
-    t : optional knot vector. If None, built from min/max of x.
-    ridge_lambda : ridge regularization (>=0). 0 -> plain least squares.
-
-    Returns
-    -------
-    (t, p, c_edge)
-      t : knot vector
-      p : degree
-      c_edge : coefficients shape (K,)
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if x.ndim != 1 or y.ndim != 1:
-        raise ValueError("x and y must be 1D arrays.")
-    if len(x) != len(y):
-        raise ValueError("x and y must have same length.")
-    if ridge_lambda < 0:
-        raise ValueError("ridge_lambda must be >= 0.")
-
-    # Build knots if not provided
-    if t is None:
-        a, b = float(np.min(x)), float(np.max(x))
-        t = uniform_clamped_knots(a, b, n_intervals, p)
-    else:
-        t = np.asarray(t, dtype=float)
-
-    # Build design matrix
-    B = build_design_matrix_dense(x, t, p)  # (N, K)
-    _, K = B.shape
-
-    # Solve for c
-    if ridge_lambda == 0.0:
-        c_edge, *_ = np.linalg.lstsq(B, y, rcond=None)
-    else:
-        A = B.T @ B + ridge_lambda * np.eye(K)
-        bvec = B.T @ y
-        c_edge = np.linalg.solve(A, bvec)
-
-    return t, p, c_edge
-
-
-def test_learning_evolution_kan11(
-    n_train: int = 200,
-    p: int = 5,
-    n_intervals: int = 30,
-    actualisation_rate: float = 5e-2,
-    n_epochs: int = 200,
-    ridge_lambda: float = 0,
-    seed: int = 0,
-):
-    """
-    Demo function showing learning evolution on a simple target function.
-    Prints losses and coefficient snapshots.
-
-    Returns:
-        dict with knots t, final coeffs c, loss history, and a test RMSE.
-    """
-    rng = np.random.default_rng(seed)
-
-    # 1) Create a toy regression dataset: y = sin(pi x) + noise
-    a, b = -2.0, 2.0
-    x_train = rng.uniform(a, b, size=n_train)
-    y_true = np.sin(np.pi * x_train)
-    y_train = y_true + 0.05 * rng.standard_normal(n_train)
-
-    # 2) Build knots (fixed bases!)
-    t = uniform_clamped_knots(a, b, n_intervals, p)
-
-    # 3) Train with GD to show evolution
-    c, losses = train_kan11_gd(
-        x_train,
-        y_train,
-        t,
-        p,
-        actualisation_rate=actualisation_rate,
-        n_epochs=n_epochs,
-        ridge_lambda=ridge_lambda,
-        seed=seed,
-    )
-
-    # 4) Show evolution snapshots
-    print("=== KAN(1,1) learning evolution (GD on spline coeffs) ===")
-    for ep in [1, 5, 10, 20, 50, 100, n_epochs]:
-        if 1 <= ep <= n_epochs:
-            print(f"Epoch {ep:4d} | loss = {losses[ep-1]:.6f}")
-
-    # Show a few coefficients (beginning, middle, end indices)
-    K = len(c)
-    idxs = [0, 1, 2, K // 2, K - 3, K - 2, K - 1] if K >= 7 else list(range(K))
-    print("\nSome learned coefficients c[k]:")
-    for k in idxs:
-        print(f"  c[{k:3d}] = {c[k]: .6f}")
-
-    # 5) Evaluate on a test grid
-    x_test = np.linspace(a, b, 400)
-    y_test = np.sin(np.pi * x_test)
-    y_estimated = predict_kan11(x_test, t, p, c)
-    rmse = float(np.sqrt(np.mean((y_estimated - y_test) ** 2)))
-    print(f"\nTest RMSE (vs noiseless sin(pi x)) = {rmse:.6f}")
-
-    _, axs = plt.subplots(2, 1, figsize=(9, 7))
-
-    # Plot the losses evolution
-    axs[0].plot(losses)
-    axs[0].set_xlabel("Number of data training")
-    axs[0].set_ylabel("Loss")
-    axs[0].grid(True)
-
-    # Plot the estimation result
-    axs[1].plot(x_test, y_test, label="Real")
-    axs[1].plot(x_test, y_estimated, label="Estimated")
-    axs[1].grid(True)
-
-    plt.show()
-
-    return {
-        "t": t,
-        "p": p,
-        "c": c,
-        "losses": losses,
-        "rmse_test": rmse,
-        "x_test": x_test,
-        "y_hat_test": y_estimated,
-        "y_test": y_test,
+    history = {
+        "train_loss": [],
+        "train_mse": [],
+        "train_reg": [],
+        "val_loss": [],
+        "val_mse": [],
     }
 
+    for epoch in range(1, epochs + 1):
+        model.train()
+        sum_loss = 0.0
+        sum_mse = 0.0
+        sum_reg = 0.0
+        n_samples = 0
 
-def test_kan_1_1():
-    # Exemple: approx sin(pi x) sur [-10,10]
-    x = np.linspace(-10, 10, 500)
-    y = np.sin(np.pi * x)
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
 
-    t, p, c = train_kan_1_1(x, y, p=3, n_intervals=20, ridge_lambda=1e-3)
+            y_hat = model(xb)
+            mse = torch.mean((y_hat - yb) ** 2)
 
-    # Prédictions
-    y_estimated = np.array([edge_spline_forward(float(xi), t, p, c) for xi in x])
+            reg = 0.0
+            if (lambda_l1 != 0.0) or (lambda_smooth != 0.0):
+                reg = model.regularization(
+                    lambda_l1=lambda_l1,
+                    lambda_smooth=lambda_smooth,
+                    diff_order=diff_order,
+                )
 
-    rmse = np.sqrt(np.mean((y_estimated - y) ** 2))
-    print("RMSE:", rmse)
+            loss = mse + reg
+            loss.backward()
+            optimizer.step()
 
-    plt.plot(x, y, label="Real")
-    plt.plot(x, y_estimated, label="Estimated")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+            bs = xb.shape[0]
+            sum_loss += float(loss.detach().item()) * bs
+            sum_mse += float(mse.detach().item()) * bs
+            sum_reg += (
+                float(reg.detach().item()) * bs
+                if isinstance(reg, torch.Tensor)
+                else float(reg) * bs
+            )
+            n_samples += bs
 
+        train_loss = sum_loss / n_samples
+        train_mse = sum_mse / n_samples
+        train_reg = sum_reg / n_samples
 
-def test():
-    p = 3
-    t = uniform_clamped_knots(-1.0, 1.0, n_intervals=5, p=p)
-    K = len(t) - p - 1
-    print(K)
+        history["train_loss"].append(train_loss)
+        history["train_mse"].append(train_mse)
+        history["train_reg"].append(train_reg)
 
-    d_in, d_out = 3, 4
-    u = np.array([0.1, -0.3, 0.7])
-    c_edges = np.random.randn(d_out, d_in, K)
+        val_loss = None
+        val_mse = None
+        if val_loader is not None:
+            model.eval()
+            sum_vloss = 0.0
+            sum_vmse = 0.0
+            vn = 0
 
-    y = kan_layer_forward(u, t, p, c_edges)
-    print(y)  # (4,)
-    print(c_edges.shape)
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    y_hat = model(xb)
+                    vmse = torch.mean((y_hat - yb) ** 2)
 
+                    vreg = 0.0
+                    if (lambda_l1 != 0.0) or (lambda_smooth != 0.0):
+                        vreg = model.regularization(
+                            lambda_l1=lambda_l1,
+                            lambda_smooth=lambda_smooth,
+                            diff_order=diff_order,
+                        )
 
-if __name__ == "__main__":
-    out = test_learning_evolution_kan11()
+                    vloss = vmse + vreg
+
+                    bs = xb.shape[0]
+                    sum_vloss += float(vloss.item()) * bs
+                    sum_vmse += float(vmse.item()) * bs
+                    vn += bs
+
+            val_loss = sum_vloss / vn
+            val_mse = sum_vmse / vn
+            history["val_loss"].append(val_loss)
+            history["val_mse"].append(val_mse)
+
+        if (epoch == 1) or (epoch % print_every == 0) or (epoch == epochs):
+            if val_loader is None:
+                print(
+                    f"Epoch {epoch:4d}/{epochs} | "
+                    f"train_loss={train_loss:.6e} (mse={train_mse:.6e}, reg={train_reg:.6e})"
+                )
+            else:
+                print(
+                    f"Epoch {epoch:4d}/{epochs} | "
+                    f"train_loss={train_loss:.6e} (mse={train_mse:.6e}, reg={train_reg:.6e}) | "
+                    f"val_loss={val_loss:.6e} (mse={val_mse:.6e})"
+                )
+
+    return history

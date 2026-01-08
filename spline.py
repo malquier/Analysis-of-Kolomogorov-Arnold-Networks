@@ -1,229 +1,173 @@
-import numpy as np
+"""
+spline.py (Torch)
+
+Differentiable B-spline utilities implemented in PyTorch.
+
+This module replaces the former NumPy-based implementation so that gradients
+can flow through the B-spline basis computation w.r.t. inputs `x`.
+
+Notes
+-----
+- B-spline basis functions are piecewise polynomials. They are differentiable
+  almost everywhere in x (except exactly at knot locations).
+- The *support selection* (whether x is inside a knot interval) uses boolean
+  masks (comparisons). Gradients do not propagate through those comparisons,
+  which is fine: the basis functions still depend smoothly on x inside each
+  interval. For PINN/PDE use, you typically avoid evaluating exactly on knots.
+
+The main function you will use is:
+    bspline_basis_matrix(x, t, p)
+which returns the full basis vector b(x) of length K = len(t) - p - 1.
+
+We also keep:
+    uniform_clamped_knots(a, b, n_intervals, p)
+so existing code can keep importing it.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+import torch
 
 
-def find_span(t: np.ndarray, p: int, x: float) -> int:
-    """
-    Return s such that t[s] <= x < t[s+1]
-    Convention: if x == t[K], return K-1
-    where K = len(t) - p - 1
-    """
-    K = len(t) - p - 1
-
-    if x >= t[K]:
-        return K - 1
-    if x <= t[p]:
-        return p  # left boundary
-
-    low, high = p, K
-    mid = (low + high) // 2
-
-    while not (t[mid] <= x < t[mid + 1]):
-        if x < t[mid]:
-            high = mid
-        else:
-            low = mid
-        mid = (low + high) // 2
-
-    return mid
-
-
-def basis_funs(t: np.ndarray, p: int, s: int, x: float) -> np.ndarray:
-    """
-    Compute the (p+1) nonzero B-spline basis functions at x:
-    returns N[0..p] = [B_{s-p,p}(x), ..., B_{s,p}(x)]
-    (Algorithm 'BasisFuns' from Piegl & Tiller)
-    """
-    N = np.zeros(p + 1, dtype=float)
-    left = np.zeros(p + 1, dtype=float)
-    right = np.zeros(p + 1, dtype=float)
-
-    N[0] = 1.0
-    for j in range(1, p + 1):
-        left[j] = x - t[s + 1 - j]
-        right[j] = t[s + j] - x
-        saved = 0.0
-
-        for r in range(0, j):
-            denom = right[r + 1] + left[j - r]
-            temp = 0.0 if denom == 0.0 else N[r] / denom
-            N[r] = saved + right[r + 1] * temp
-            saved = left[j - r] * temp
-
-        N[j] = saved
-
-    return N
-
-
-def basis_vector(u: float, t: np.ndarray, p: int) -> np.ndarray:
-    """
-    Full basis vector b(u) of length K, with only p+1 non-zeros.
-    """
-    K = len(t) - p - 1
-    u_clamped = min(max(float(u), float(t[p])), float(t[K]))
-    s = find_span(t, p, u_clamped)
-    N = basis_funs(t, p, s, u_clamped)  # shape (p+1,)
-    first = s - p
-
-    b = np.zeros(K, dtype=float)
-    b[first : first + p + 1] = N
-    return b
-
-
-def uniform_clamped_knots(a: float, b: float, n_intervals: int, p: int) -> np.ndarray:
-    """
-    Open uniform clamped knot vector on [a,b] with n_intervals intervals.
-    Internal knots are uniform; endpoints repeated p+1 times.
-    """
+def uniform_clamped_knots(
+    a: float,
+    b: float,
+    n_intervals: int,
+    p: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Open uniform clamped knot vector on [a,b] with n_intervals intervals."""
     if n_intervals < 1:
         raise ValueError("n_intervals must be >= 1")
     if not (b > a):
         raise ValueError("Require b > a")
+    if p < 0:
+        raise ValueError("p must be >= 0")
 
-    h = (b - a) / n_intervals
-    internal = np.array(
-        [a + i * h for i in range(1, n_intervals)], dtype=float
-    )  # k-1 points
-    t = np.concatenate([np.full(p + 1, a), internal, np.full(p + 1, b)])
+    h = (b - a) / float(n_intervals)
+
+    # internal knots: a+h, ..., b-h  (n_intervals-1 points)
+    if n_intervals == 1:
+        internal = torch.empty((0,), device=device, dtype=dtype)
+    else:
+        internal = torch.linspace(
+            a + h, b - h, n_intervals - 1, device=device, dtype=dtype
+        )
+
+    t = torch.cat(
+        [
+            torch.full((p + 1,), a, device=device, dtype=dtype),
+            internal,
+            torch.full((p + 1,), b, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
     return t
 
 
-def build_design_matrix_dense(x: np.ndarray, t: np.ndarray, p: int) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    t = np.asarray(t, dtype=float)
-
-    K = len(t) - p - 1
-    B = np.zeros((len(x), K), dtype=float)
-
-    lo = float(t[p])
-    hi = float(t[K])
-
-    for n, xn in enumerate(x):
-        xn = min(max(float(xn), lo), hi)
-        s = find_span(t, p, xn)
-        Nvals = basis_funs(t, p, s, xn)
-        first = s - p
-        B[n, first : first + p + 1] = Nvals
-
-    return B
+def clamp_to_domain(x: torch.Tensor, t: torch.Tensor, p: int) -> torch.Tensor:
+    """Clamp x into the valid spline domain [t[p], t[K]] with K=len(t)-p-1."""
+    if p < 0:
+        raise ValueError("p must be >= 0")
+    K = t.numel() - p - 1
+    if K <= 0:
+        raise ValueError("Invalid knot vector length for given degree.")
+    lo = t[p]
+    hi = t[K]
+    return torch.clamp(x, min=lo, max=hi)
 
 
-def fit_spline_ls(x: np.ndarray, y: np.ndarray, t: np.ndarray, p: int) -> np.ndarray:
-    """
-    Least squares fit: c = argmin ||B c - y||^2
-    """
-    B = build_design_matrix_dense(x, t, p)
-    c, *_ = np.linalg.lstsq(B, y, rcond=None)
-    return c
-
-
-def difference_matrix(K: int, order: int = 2) -> np.ndarray:
-    """
-    Build a finite-difference matrix D of shape (K-order, K) such that:
-    - order=1: (Dc)[i] = c[i+1] - c[i]
-    - order=2: (Dc)[i] = c[i+2] - 2c[i+1] + c[i]
-    More generally, uses binomial coefficients with alternating signs.
-    """
-    if order < 0:
-        raise ValueError("order must be >= 0")
-    if order == 0:
-        return np.eye(K)
-
-    if K <= order:
-        raise ValueError("Need K > order to build difference matrix.")
-
-    # coefficients for forward differences: [(-1)^(order-j) * C(order, j)] for j=0..order
-    # e.g. order=2 -> [1, -2, 1]
-    coeffs = np.array(
-        [((-1) ** (order - j)) * comb(order, j) for j in range(order + 1)], dtype=float
-    )
-
-    D = np.zeros((K - order, K), dtype=float)
-    for i in range(K - order):
-        D[i, i : i + order + 1] = coeffs
-    return D
-
-
-def comb(n: int, k: int) -> int:
-    # small helper, exact integer binomial coefficient
-    if k < 0 or k > n:
-        return 0
-    k = min(k, n - k)
-    num = 1
-    den = 1
-    for j in range(1, k + 1):
-        num *= n - (k - j)
-        den *= j
-    return num // den
-
-
-def fit_spline_ridge_dense(
-    x: np.ndarray,
-    y: np.ndarray,
-    t: np.ndarray,
-    p: int,
-    smoothness_coeff: float = 1e-3,
-    diff_order: int = 2,
-) -> np.ndarray:
-    """
-    Ridge-regularized spline fit:
-        min_c ||B c - y||^2 + lmbd ||D c||^2
+def bspline_basis_matrix(x: torch.Tensor, t: torch.Tensor, p: int) -> torch.Tensor:
+    """Compute the full B-spline basis matrix in torch (differentiable).
 
     Parameters
     ----------
-    x, y : arrays of shape (N,)
-    t    : knot vector (clamped), shape (m,)
-    p    : spline degree
-    lmbd : regularization strength (>=0)
-    diff_order : order of finite differences in penalty (typically 2)
+    x : torch.Tensor
+        Shape (B,) or (...) any shape. Will be flattened and restored.
+    t : torch.Tensor
+        Knot vector, shape (m,). Should be non-decreasing.
+    p : int
+        Spline degree.
 
     Returns
     -------
-    c : coefficients of shape (K,)
+    B : torch.Tensor
+        Basis values with shape (*x.shape, K) where K = len(t) - p - 1.
+
+    Implementation
+    --------------
+    Uses Cox–de Boor recursion with vectorized torch ops.
     """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    if p < 0:
+        raise ValueError("p must be >= 0")
+    if t.ndim != 1:
+        raise ValueError("t must be a 1D knot vector")
 
-    if smoothness_coeff < 0:
-        raise ValueError("smoothness_coeff must be >= 0")
+    orig_shape = x.shape
+    x = x.reshape(-1)  # (B,)
 
-    B = build_design_matrix_dense(x, t, p)  # (N, K)
-    N, K = B.shape
+    device = x.device
+    dtype = x.dtype
+    t = t.to(device=device, dtype=dtype)
 
-    # Unregularized case
-    if smoothness_coeff == 0.0:
-        c, *_ = np.linalg.lstsq(B, y, rcond=None)
-        return c
+    m = t.numel()
+    K = m - p - 1
+    if K <= 0:
+        raise ValueError(f"Invalid knot vector length: len(t)={m}, p={p}")
 
-    D = difference_matrix(K, order=diff_order)  # (K-diff_order, K)
+    # Clamp to valid domain.
+    x = clamp_to_domain(x, t, p)
 
-    A = B.T @ B + smoothness_coeff * (D.T @ D)  # (K, K)
-    b = B.T @ y  # (K,)
+    # Degree-0 bases: N_{i,0}(x) = 1 if t[i] <= x < t[i+1] else 0
+    x_col = x.unsqueeze(1)  # (B,1)
+    t0 = t[:-1].unsqueeze(0)  # (1, m-1)
+    t1 = t[1:].unsqueeze(0)  # (1, m-1)
+    N = ((x_col >= t0) & (x_col < t1)).to(dtype)  # (B, m-1)
 
-    # Solve (SPD in practice for smoothness_coeff>0) - use solve; fall back to lstsq if needed
-    try:
-        c = np.linalg.solve(A, b)
-    except np.linalg.LinAlgError:
-        c, *_ = np.linalg.lstsq(A, b, rcond=None)
+    # Special case: x == t[-1] belongs to last interval
+    at_end = torch.isclose(x, t[-1])
+    if at_end.any():
+        N[at_end] = 0.0
+        N[at_end, -1] = 1.0
 
-    return c
+    # Cox–de Boor recursion
+    for k in range(1, p + 1):
+        # Build denominators for all i at once
+        t_i = t[: -k - 1]  # (m-k-1,)
+        t_ik = t[k:-1]  # (m-k-1,)
+        t_i1 = t[1:-k]  # (m-k-1,)
+        t_ik1 = t[k + 1 :]  # (m-k-1,)
 
+        denom_left = (t_ik - t_i).unsqueeze(0)  # (1, m-k-1)
+        denom_right = (t_ik1 - t_i1).unsqueeze(0)  # (1, m-k-1)
 
-def eval_spline(x0: float, t: np.ndarray, p: int, c: np.ndarray) -> float:
-    t = np.asarray(t, dtype=float)
-    c = np.asarray(c, dtype=float)
+        # Previous N has shape (B, m-k)
+        N_left = N[:, :-1]  # (B, m-k-1)
+        N_right = N[:, 1:]  # (B, m-k-1)
 
-    K = len(t) - p - 1
-    x0 = min(max(float(x0), float(t[p])), float(t[K]))
+        left_num = x_col - t_i.unsqueeze(0)  # (B, m-k-1)
+        right_num = t_ik1.unsqueeze(0) - x_col  # (B, m-k-1)
 
-    s = find_span(t, p, x0)
-    Nvals = basis_funs(t, p, s, x0)
-    first = s - p
-    return float(np.dot(c[first : first + p + 1], Nvals))
+        # IMPORTANT: torch.where evaluates both branches,
+        # so we must avoid dividing by zero even if we mask later.
+        mask_left = denom_left > 0
+        mask_right = denom_right > 0
 
+        denom_left_safe = torch.where(
+            mask_left, denom_left, torch.ones_like(denom_left)
+        )
+        denom_right_safe = torch.where(
+            mask_right, denom_right, torch.ones_like(denom_right)
+        )
 
-def test():
-    return ()
+        left_term = (left_num / denom_left_safe) * N_left * mask_left.to(dtype)
+        right_term = (right_num / denom_right_safe) * N_right * mask_right.to(dtype)
 
+        N = left_term + right_term  # (B, m-k-1)
 
-if __name__ == "__main__":
-    test()
+    # After recursion, N has shape (B, K)
+    B = N.reshape(*orig_shape, K)
+    return B
