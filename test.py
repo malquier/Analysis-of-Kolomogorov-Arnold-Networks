@@ -284,7 +284,7 @@ def simulate_random(a: float, b: float, n: int) -> list:
 
 
 def test_spline_plot():
-    x = np.linspace(-10, 10, 100)
+    x = np.linspace(-10, 1, 100)
     y = np.sin(np.pi * x)
     p = 3
     n_intervals = 30
@@ -329,4 +329,4 @@ def test():
 
 
 if __name__ == "__main__":
-    test_spline()
+    test_spline_plot()

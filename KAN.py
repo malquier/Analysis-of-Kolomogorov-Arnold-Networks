@@ -1,9 +1,15 @@
-import numpy as np
 import matplotlib.pyplot as plt
 from spline import *
 from typing import Union
 
 LayerParams = tuple[np.ndarray, int, np.ndarray]
+
+
+"""
+
+----------------------------- Construction of KAN forward -----------------------------
+
+"""
 
 
 def edge_spline_forward(u: float, t: np.ndarray, p: int, c_edge: np.ndarray) -> float:
@@ -123,6 +129,13 @@ def kan_forward(
     return h
 
 
+"""
+
+----------------------------- Loss functions -----------------------------
+
+"""
+
+
 def mse(y: np.ndarray, y_hat: np.ndarray) -> float:
     y = np.asarray(y, dtype=float)
     y_hat = np.asarray(y_hat, dtype=float)
@@ -139,6 +152,13 @@ def mse_loss(dataset, network_params: list[LayerParams]) -> float:
         y_hat = kan_forward(x, network_params)
         total += mse(y, y_hat)
     return total / N
+
+
+"""
+
+----------------------------- KAn for (1,1)-layer -----------------------------
+
+"""
 
 
 def predict_kan11(x: np.ndarray, t: np.ndarray, p: int, c: np.ndarray) -> np.ndarray:
@@ -267,11 +287,11 @@ def train_kan_1_1(
 
 def test_learning_evolution_kan11(
     n_train: int = 200,
-    p: int = 3,
+    p: int = 5,
     n_intervals: int = 30,
     actualisation_rate: float = 5e-2,
     n_epochs: int = 200,
-    ridge_lambda: float = 1e-4,
+    ridge_lambda: float = 0,
     seed: int = 0,
 ):
     """

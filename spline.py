@@ -88,18 +88,19 @@ def uniform_clamped_knots(a: float, b: float, n_intervals: int, p: int) -> np.nd
 
 
 def build_design_matrix_dense(x: np.ndarray, t: np.ndarray, p: int) -> np.ndarray:
-    """
-    Dense design matrix B of shape (N, K) where
-    B[n, i] = B_{i,p}(x[n]).
-    Uses locality: only p+1 entries per row are nonzero.
-    """
     x = np.asarray(x, dtype=float)
+    t = np.asarray(t, dtype=float)
+
     K = len(t) - p - 1
     B = np.zeros((len(x), K), dtype=float)
 
+    lo = float(t[p])
+    hi = float(t[K])
+
     for n, xn in enumerate(x):
-        s = find_span(t, p, float(xn))
-        Nvals = basis_funs(t, p, s, float(xn))
+        xn = min(max(float(xn), lo), hi)
+        s = find_span(t, p, xn)
+        Nvals = basis_funs(t, p, s, xn)
         first = s - p
         B[n, first : first + p + 1] = Nvals
 
@@ -113,9 +114,6 @@ def fit_spline_ls(x: np.ndarray, y: np.ndarray, t: np.ndarray, p: int) -> np.nda
     B = build_design_matrix_dense(x, t, p)
     c, *_ = np.linalg.lstsq(B, y, rcond=None)
     return c
-
-
-import numpy as np
 
 
 def difference_matrix(K: int, order: int = 2) -> np.ndarray:
@@ -163,7 +161,7 @@ def fit_spline_ridge_dense(
     y: np.ndarray,
     t: np.ndarray,
     p: int,
-    lmbd: float = 1e-3,
+    smoothness_coeff: float = 1e-3,
     diff_order: int = 2,
 ) -> np.ndarray:
     """
@@ -185,23 +183,23 @@ def fit_spline_ridge_dense(
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    if lmbd < 0:
-        raise ValueError("lmbd must be >= 0")
+    if smoothness_coeff < 0:
+        raise ValueError("smoothness_coeff must be >= 0")
 
     B = build_design_matrix_dense(x, t, p)  # (N, K)
     N, K = B.shape
 
     # Unregularized case
-    if lmbd == 0.0:
+    if smoothness_coeff == 0.0:
         c, *_ = np.linalg.lstsq(B, y, rcond=None)
         return c
 
     D = difference_matrix(K, order=diff_order)  # (K-diff_order, K)
 
-    A = B.T @ B + lmbd * (D.T @ D)  # (K, K)
+    A = B.T @ B + smoothness_coeff * (D.T @ D)  # (K, K)
     b = B.T @ y  # (K,)
 
-    # Solve (SPD in practice for lmbd>0) - use solve; fall back to lstsq if needed
+    # Solve (SPD in practice for smoothness_coeff>0) - use solve; fall back to lstsq if needed
     try:
         c = np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
@@ -211,12 +209,14 @@ def fit_spline_ridge_dense(
 
 
 def eval_spline(x0: float, t: np.ndarray, p: int, c: np.ndarray) -> float:
-    """
-    Evaluate spline at x0 using only p+1 local basis functions.
-    """
+    t = np.asarray(t, dtype=float)
+    c = np.asarray(c, dtype=float)
+
     K = len(t) - p - 1
-    s = find_span(t, p, float(x0))
-    Nvals = basis_funs(t, p, s, float(x0))
+    x0 = min(max(float(x0), float(t[p])), float(t[K]))
+
+    s = find_span(t, p, x0)
+    Nvals = basis_funs(t, p, s, x0)
     first = s - p
     return float(np.dot(c[first : first + p + 1], Nvals))
 
