@@ -1,332 +1,248 @@
-import numpy as np
-from spline import *
-import time
-import matplotlib.pyplot as plt
+import math
+import torch
+import torch.nn as nn
 
-import numpy as np
+# Import ton KAN
+from kan import KANNet
 
 
-class TestSpline:
+# -----------------------------
+# 1) Black-Scholes closed-form (pour validation)
+# -----------------------------
+def norm_cdf(x: torch.Tensor) -> torch.Tensor:
+    # CDF normale via erf (torch)
+    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
+@torch.no_grad()
+def bs_call_closed_form(S, K, r, sigma, T, t):
+    # S, t tensors
+    tau = (T - t).clamp_min(1e-12)
+    d1 = (torch.log(S / K) + (r + 0.5 * sigma**2) * tau) / (sigma * torch.sqrt(tau))
+    d2 = d1 - sigma * torch.sqrt(tau)
+    return S * norm_cdf(d1) - K * torch.exp(-r * tau) * norm_cdf(d2)
+
+
+# -----------------------------
+# 2) Sampling points
+# -----------------------------
+def sample_collocation(n, T, S_max, device):
+    t = torch.rand(n, 1, device=device) * T
+    S = torch.rand(n, 1, device=device) * S_max
+    x = torch.cat([t, S], dim=1)
+    x.requires_grad_(True)
+    return x
+
+
+def sample_terminal(n, T, S_max, device):
+    t = torch.full((n, 1), T, device=device)
+    S = torch.rand(n, 1, device=device) * S_max
+    x = torch.cat([t, S], dim=1)
+    return x
+
+
+def sample_boundary_S0(n, T, device):
+    t = torch.rand(n, 1, device=device) * T
+    S = torch.zeros(n, 1, device=device)
+    x = torch.cat([t, S], dim=1)
+    return x
+
+
+def sample_boundary_Smax(n, T, S_max, device):
+    t = torch.rand(n, 1, device=device) * T
+    S = torch.full((n, 1), S_max, device=device)
+    x = torch.cat([t, S], dim=1)
+    return x
+
+
+# -----------------------------
+# 3) PDE residual computation
+# -----------------------------
+def pde_residual_black_scholes(model, x, r, sigma):
     """
-    Lightweight test suite for a 1D B-spline approximation pipeline.
-
-    Expected API functions:
-      - uniform_clamped_knots(a: float, b: float, n_intervals: int, p: int) -> array-like
-      - find_span(t, p, x) -> int
-      - basis_funs(t, p, s, x) -> array-like of shape (p+1,)
-      - build_design_matrix_dense(x, t, p) -> ndarray (N, K)   [optional but recommended]
-      - fit_spline_ls(x, y, t, p) -> coeffs of shape (K,)
-      - eval_spline(x0, t, p, c) -> float
-
-    Notes:
-      - If you don't have build_design_matrix_dense, LS tests can still run
-        if fit_spline_ls exists. Some checks will be skipped.
+    x: (N,2) with columns [t, S], requires_grad=True
+    returns: residual tensor (N,1)
     """
+    t = x[:, 0:1]
+    S = x[:, 1:2]
 
-    def __init__(self, api: dict, verbose: bool = True):
-        self.api = api
-        self.verbose = verbose
+    C = model(x)  # (N,1) ideally
+    if C.ndim == 1:
+        C = C.unsqueeze(1)
 
-        # Required
-        self.uniform_clamped_knots = api.get("uniform_clamped_knots")
-        self.find_span = api.get("find_span")
-        self.basis_funs = api.get("basis_funs") or api.get("basis_functions")
-        self.fit_spline_ls = api.get("fit_spline_ls")
-        self.eval_spline = api.get("eval_spline")
+    # dC/dt and dC/dS
+    grads = torch.autograd.grad(
+        C,
+        x,
+        grad_outputs=torch.ones_like(C),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    C_t = grads[:, 0:1]
+    C_S = grads[:, 1:2]
 
-        # Optional (but useful)
-        self.build_design_matrix_dense = api.get("build_design_matrix_dense")
+    # d2C/dS2
+    C_SS = torch.autograd.grad(
+        C_S,
+        x,
+        grad_outputs=torch.ones_like(C_S),
+        create_graph=True,
+        retain_graph=True,
+    )[0][:, 1:2]
 
-        self._check_required()
+    # Black-Scholes PDE residual:
+    # C_t + 0.5*sigma^2*S^2*C_SS + r*S*C_S - r*C = 0
+    res = C_t + 0.5 * sigma**2 * (S**2) * C_SS + r * S * C_S - r * C
+    return res
 
-    # ---------- helpers ----------
-    def _check_required(self):
-        missing = []
-        for name, fn in [
-            ("uniform_clamped_knots", self.uniform_clamped_knots),
-            ("find_span", self.find_span),
-            ("basis_funs/basis_functions", self.basis_funs),
-            ("fit_spline_ls", self.fit_spline_ls),
-            ("eval_spline", self.eval_spline),
-        ]:
-            if fn is None:
-                missing.append(name)
-        if missing:
-            raise ValueError(f"Missing required API functions: {missing}")
 
-    def _assert(self, cond: bool, msg: str):
-        if not cond:
-            raise AssertionError(msg)
+# -----------------------------
+# 4) Training loop (PINN)
+# -----------------------------
+def train_kan_black_scholes_call(
+    *,
+    K=100.0,
+    r=0.05,
+    sigma=0.2,
+    T=1.0,
+    S_max=300.0,
+    dims=(2, 32, 32, 1),
+    p=3,
+    n_intervals=20,
+    lr=1e-3,
+    steps=200,
+    n_f=4096,  # collocation
+    n_t=2048,  # terminal
+    n_b=2048,  # boundary each
+    w_pde=1.0,
+    w_term=10.0,
+    w_bc=1.0,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+):
+    device = torch.device(device)
 
-    def _allclose(self, a, b, tol=1e-10):
-        return np.allclose(a, b, atol=tol, rtol=0)
+    # Domain scaling:
+    # KAN knots are typically on [-1,1], so it's smart to normalize inputs.
+    # We'll map t in [0,T] -> [-1,1], S in [0,S_max] -> [-1,1].
+    def scale_in(x):
+        t = x[:, 0:1]
+        S = x[:, 1:2]
+        t_ = 2.0 * (t / T) - 1.0
+        S_ = 2.0 * (S / S_max) - 1.0
+        return torch.cat([t_, S_], dim=1)
 
-    def _print(self, s: str):
-        if self.verbose:
-            print(s)
+    # Build model with per-layer domains [-1,1]
+    domains = [(-1.0, 1.0)] * (len(dims) - 1)
+    model = KANNet(
+        dims=list(dims),
+        p=p,
+        n_intervals=n_intervals,
+        domains=domains,
+        init_scale=1e-2,
+        device=device,
+        dtype=torch.float32,
+    ).to(device)
 
-    # ---------- tests ----------
-    def test_uniform_clamped_knots_structure(self):
-        a, b = -10.0, 10.0
-        p = 3
-        k = 7  # n_intervals
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-        expected_len = (p + 1) + (k - 1) + (p + 1)
-        self._assert(
-            len(t) == expected_len,
-            f"Knots length mismatch: got {len(t)}, expected {expected_len}",
-        )
+    for step in range(1, steps + 1):
+        model.train()
+        opt.zero_grad()
 
-        self._assert(np.all(np.diff(t) >= 0), "Knots must be nondecreasing.")
+        # --- collocation points for PDE
+        xf = sample_collocation(n_f, T, S_max, device)
+        # scale but KEEP grad flow: scaling is torch ops so autograd OK
+        xf_s = scale_in(xf)
+        xf_s.requires_grad_(True)
 
-        self._assert(
-            np.all(t[: p + 1] == a),
-            f"Left boundary should repeat a={a} exactly p+1 times.",
-        )
-        self._assert(
-            np.all(t[-(p + 1) :] == b),
-            f"Right boundary should repeat b={b} exactly p+1 times.",
-        )
+        # --- terminal points
+        xt = sample_terminal(n_t, T, S_max, device)
+        xt_s = scale_in(xt)
 
-        internal = t[p + 1 : -(p + 1)]
-        if len(internal) > 1:
-            diffs = np.diff(internal)
-            self._assert(
-                self._allclose(diffs, diffs[0], tol=1e-12),
-                "Internal knots are not uniformly spaced.",
+        # --- boundaries
+        xb0 = sample_boundary_S0(n_b, T, device)
+        xb0_s = scale_in(xb0)
+
+        xbS = sample_boundary_Smax(n_b, T, S_max, device)
+        xbS_s = scale_in(xbS)
+
+        # PDE residual
+        # Important: pde uses unscaled S in coefficient terms S^2, S, etc.
+        # So we pass x in ORIGINAL scale to compute S, but model consumes scaled.
+        # Easiest: define a wrapper model_scaled that expects original x.
+        def model_on_original(x_orig):
+            return model(scale_in(x_orig))
+
+        res = pde_residual_black_scholes(model_on_original, xf, r, sigma)
+        loss_pde = torch.mean(res**2)
+
+        # Terminal payoff
+        S_t = xt[:, 1:2]
+        payoff = torch.clamp(S_t - K, min=0.0)
+        C_T = model(xt_s)
+        if C_T.ndim == 1:
+            C_T = C_T.unsqueeze(1)
+        loss_term = torch.mean((C_T - payoff) ** 2)
+
+        # Boundary S=0: C=0
+        C_0 = model(xb0_s)
+        if C_0.ndim == 1:
+            C_0 = C_0.unsqueeze(1)
+        loss_bc0 = torch.mean(C_0**2)
+
+        # Boundary S=Smax: C = Smax - K*exp(-r*(T-t))
+        t_b = xbS[:, 0:1]
+        bcS_target = S_max - K * torch.exp(-r * (T - t_b))
+        C_Smax = model(xbS_s)
+        if C_Smax.ndim == 1:
+            C_Smax = C_Smax.unsqueeze(1)
+        loss_bcS = torch.mean((C_Smax - bcS_target) ** 2)
+
+        loss_bc = loss_bc0 + loss_bcS
+
+        loss = w_pde * loss_pde + w_term * loss_term + w_bc * loss_bc
+        loss.backward()
+        opt.step()
+
+        if step == 1 or step % 200 == 0:
+            # quick validation at t=0 on random S
+            with torch.no_grad():
+                S_test = torch.linspace(0.0, S_max, 200, device=device).unsqueeze(1)
+                t0 = torch.zeros_like(S_test)
+                x_test = torch.cat([t0, S_test], dim=1)
+                pred = model(scale_in(x_test))
+                if pred.ndim == 1:
+                    pred = pred.unsqueeze(1)
+                true = bs_call_closed_form(S_test, K, r, sigma, T, t0)
+
+                rmse = torch.sqrt(torch.mean((pred - true) ** 2)).item()
+
+            print(
+                f"step {step:5d} | "
+                f"loss={loss.item():.3e} "
+                f"(pde={loss_pde.item():.3e}, term={loss_term.item():.3e}, bc={loss_bc.item():.3e}) "
+                f"| rmse(t=0)={rmse:.3e}"
             )
 
-    def test_find_span_basic(self):
-        a, b = 0.0, 1.0
-        p = 3
-        k = 5
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-        K = len(t) - p - 1
-
-        xs = np.linspace(a, b, 101)
-        for x in xs:
-            s = self.find_span(t, p, float(x))
-            self._assert(
-                p <= s <= K - 1, f"Span s out of range: s={s}, expected in [{p},{K-1}]"
-            )
-
-            # Span property (except the right endpoint handled specially)
-            if x < t[K]:
-                self._assert(
-                    t[s] <= x < t[s + 1],
-                    f"Span condition violated at x={x}: "
-                    f"t[s]={t[s]}, t[s+1]={t[s+1]}, s={s}",
-                )
-            else:
-                self._assert(
-                    s == K - 1, f"At x==t[K], span should be K-1. Got s={s}, K-1={K-1}"
-                )
-
-    def test_basis_partition_unity_and_nonnegativity(self):
-        a, b = -2.0, 3.0
-        p = 3
-        k = 8
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-        K = len(t) - p - 1
-
-        xs = np.linspace(a, b, 200)
-        for x in xs:
-            s = self.find_span(t, p, float(x))
-            N = np.asarray(self.basis_funs(t, p, s, float(x)), dtype=float)
-
-            self._assert(
-                N.shape == (p + 1,),
-                f"basis_funs must return shape (p+1,), got {N.shape}",
-            )
-
-            self._assert(
-                np.all(N >= -1e-12),
-                f"Basis functions should be nonnegative (up to tol) at x={x}.",
-            )
-
-            self._assert(
-                abs(N.sum() - 1.0) < 1e-10,
-                f"Partition of unity violated at x={x}. Sum={N.sum()}",
-            )
-
-            first = s - p
-            self._assert(
-                0 <= first <= K - (p + 1),
-                f"First active basis index out of bounds: first={first}, K={K}",
-            )
-
-    def test_fit_polynomial_accuracy(self):
-        p = 3
-        k = 25
-        a, b = -1.0, 1.0
-        x = np.linspace(a, b, 600)
-        y = 1.0 + 2.0 * x - 0.5 * x**2 + 0.1 * x**3
-
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-        c = np.asarray(self.fit_spline_ls(x, y, t, p), dtype=float)
-
-        yhat = np.array([self.eval_spline(float(xi), t, p, c) for xi in x])
-        rmse = float(np.sqrt(np.mean((yhat - y) ** 2)))
-
-        self._assert(
-            rmse < 1e-3, f"Polynomial fit too inaccurate. RMSE={rmse} (expected < 1e-3)"
-        )
-
-    def test_fit_sine_accuracy(self):
-        p = 3
-        k = 40
-        a, b = -10.0, 10.0
-        x = np.linspace(a, b, 1200)
-        y = np.sin(np.pi * x)
-
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-        c = np.asarray(self.fit_spline_ls(x, y, t, p), dtype=float)
-
-        x_test = np.linspace(a, b, 400)
-        y_test = np.sin(np.pi * x_test)
-        yhat = np.array([self.eval_spline(float(xi), t, p, c) for xi in x_test])
-
-        rmse = float(np.sqrt(np.mean((yhat - y_test) ** 2)))
-        self._assert(
-            rmse < 5e-2, f"Sine fit too inaccurate. RMSE={rmse} (expected < 5e-2)"
-        )
-
-    def test_fit_log_and_sqrt(self):
-        p = 3
-        k = 30
-        a, b = 0.1, 10.0
-        x = np.linspace(a, b, 800)
-
-        for func, name, thresh in [(np.log, "log", 1e-2), (np.sqrt, "sqrt", 1e-2)]:
-            y = func(x)
-            t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-            c = np.asarray(self.fit_spline_ls(x, y, t, p), dtype=float)
-            yhat = np.array([self.eval_spline(float(xi), t, p, c) for xi in x])
-            rmse = float(np.sqrt(np.mean((yhat - y) ** 2)))
-            self._assert(
-                rmse < thresh,
-                f"{name} fit too inaccurate. RMSE={rmse} (expected < {thresh})",
-            )
-
-    def test_design_matrix_locality(self):
-        """
-        Optional: checks that each row has at most p+1 nonzeros.
-        Requires build_design_matrix_dense.
-        """
-        if self.build_design_matrix_dense is None:
-            self._print(
-                "ℹ️  Skipping test_design_matrix_locality (no build_design_matrix_dense provided)."
-            )
-            return
-
-        p = 3
-        k = 10
-        a, b = -2.0, 2.0
-        t = np.asarray(self.uniform_clamped_knots(a, b, k, p), dtype=float)
-
-        x = np.linspace(a, b, 200)
-        B = np.asarray(self.build_design_matrix_dense(x, t, p), dtype=float)
-
-        # Count nonzeros per row with a tolerance
-        nnz_per_row = np.sum(np.abs(B) > 1e-14, axis=1)
-        self._assert(
-            np.all(nnz_per_row <= (p + 1)),
-            f"Locality violated: found rows with > p+1 nonzeros. "
-            f"max nnz per row = {nnz_per_row.max()}",
-        )
-
-    # ---------- runner ----------
-    def run_all(self):
-        tests = [
-            self.test_uniform_clamped_knots_structure,
-            self.test_find_span_basic,
-            self.test_basis_partition_unity_and_nonnegativity,
-            self.test_design_matrix_locality,
-            self.test_fit_polynomial_accuracy,
-            self.test_fit_sine_accuracy,
-            self.test_fit_log_and_sqrt,
-        ]
-
-        self._print("Running spline tests...")
-        for test_fn in tests:
-            name = test_fn.__name__
-            test_fn()
-            self._print(f"✅ {name} passed")
-        self._print("✅ All spline tests passed!")
-
-
-def test_spline():
-    api = {
-        "uniform_clamped_knots": uniform_clamped_knots,
-        "find_span": find_span,
-        "basis_funs": basis_funs,  # ou "basis_functions": ...
-        "build_design_matrix_dense": build_design_matrix_dense,  # optionnel
-        "fit_spline_ls": fit_spline_ls,
-        "eval_spline": eval_spline,
-    }
-
-    tester = TestSpline(api)
-    tester.run_all()
-
-
-def f1(x, y):
-    return np.exp(np.sin(np.pi * x) + y**2)
-
-
-def f2(x, y, z):
-    return f1(x, y) * np.log(z) + np.sqrt(z * (x**2))
-
-
-def simulate_random(a: float, b: float, n: int) -> list:
-    r = np.random.random(n)
-    return list(map(lambda x: a + (b - a) * x, r))
-
-
-def test_spline_plot():
-    x = np.linspace(-10, 1, 100)
-    y = np.sin(np.pi * x)
-    p = 3
-    n_intervals = 30
-
-    t = uniform_clamped_knots(-10, 10, n_intervals, p)
-
-    t0 = time.time()
-    c_ls = fit_spline_ls(x, y, t, p)
-    y_ls = [eval_spline(xi, t, p, c_ls) for xi in x]
-    t1 = time.time()
-
-    c_ridge = fit_spline_ridge_dense(x, y, t, p)
-    y_ridge = [eval_spline(xi, t, p, c_ridge) for xi in x]
-    t2 = time.time()
-
-    print("Least squares time execution:", (t1 - t0))
-    print("Ridge time execution:", (t2 - t1))
-
-    plt.plot(x, y, label="Real")
-    plt.plot(x, y_ls, label="Least Squares")
-    plt.plot(x, y_ridge, label="Ridge")
-
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-
-def test():
-    n = 500
-    x_min, x_max = -10, 10
-    y_min, y_max = -10, 10
-    z_min, z_max = 0, 10
-
-    x = simulate_random(x_min, x_max, n)
-    y = simulate_random(y_min, y_max, n)
-    z = simulate_random(z_min, z_max, n)
-
-    res = [f2(x, y, z) for (x, y, z) in zip(x, y, z)]
-    data = list(zip(x, y, z, res))
-
-    return ()
+    return model
 
 
 if __name__ == "__main__":
-    test_spline_plot()
+    model = train_kan_black_scholes_call(
+        K=100.0,
+        r=0.05,
+        sigma=0.2,
+        T=1.0,
+        S_max=300.0,
+        dims=(2, 32, 32, 1),
+        p=3,
+        n_intervals=24,
+        lr=2e-3,
+        steps=4000,
+        n_f=4096,
+        n_t=2048,
+        n_b=2048,
+        w_pde=1.0,
+        w_term=20.0,
+        w_bc=1.0,
+    )
