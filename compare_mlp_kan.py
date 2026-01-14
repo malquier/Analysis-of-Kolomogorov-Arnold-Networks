@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 # ---- Ton KAN ----
-from kan import KANNet
+from models.my_kan import KANNet
 
 
 # -------------------------

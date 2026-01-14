@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from spline import uniform_clamped_knots, bspline_basis_matrix
+from utils.spline import uniform_clamped_knots, bspline_basis_matrix
 
 
 class KANLayer(nn.Module):
