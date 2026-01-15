@@ -1,33 +1,8 @@
-"""
-spline.py (Torch)
-
-Differentiable B-spline utilities implemented in PyTorch.
-
-This module replaces the former NumPy-based implementation so that gradients
-can flow through the B-spline basis computation w.r.t. inputs `x`.
-
-Notes
------
-- B-spline basis functions are piecewise polynomials. They are differentiable
-  almost everywhere in x (except exactly at knot locations).
-- The *support selection* (whether x is inside a knot interval) uses boolean
-  masks (comparisons). Gradients do not propagate through those comparisons,
-  which is fine: the basis functions still depend smoothly on x inside each
-  interval. For PINN/PDE use, you typically avoid evaluating exactly on knots.
-
-The main function you will use is:
-    bspline_basis_matrix(x, t, p)
-which returns the full basis vector b(x) of length K = len(t) - p - 1.
-
-We also keep:
-    uniform_clamped_knots(a, b, n_intervals, p)
-so existing code can keep importing it.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
 import torch
+import numpy as np
 
 
 def uniform_clamped_knots(
@@ -171,3 +146,180 @@ def bspline_basis_matrix(x: torch.Tensor, t: torch.Tensor, p: int) -> torch.Tens
     # After recursion, N has shape (B, K)
     B = N.reshape(*orig_shape, K)
     return B
+
+
+import numpy as np
+from typing import Optional
+
+
+def uniform_clamped_knots_np(
+    a: float,
+    b: float,
+    n_intervals: int,
+    p: int,
+    *,
+    dtype: np.dtype = np.float64,
+) -> np.ndarray:
+    """Open uniform clamped knot vector on [a,b] with n_intervals intervals (NumPy)."""
+    if n_intervals < 1:
+        raise ValueError("n_intervals must be >= 1")
+    if not (b > a):
+        raise ValueError("Require b > a")
+    if p < 0:
+        raise ValueError("p must be >= 0")
+
+    h = (b - a) / float(n_intervals)
+
+    # internal knots: a+h, ..., b-h  (n_intervals-1 points)
+    if n_intervals == 1:
+        internal = np.empty((0,), dtype=dtype)
+    else:
+        internal = np.linspace(a + h, b - h, n_intervals - 1, dtype=dtype)
+
+    t = np.concatenate(
+        [
+            np.full((p + 1,), a, dtype=dtype),
+            internal,
+            np.full((p + 1,), b, dtype=dtype),
+        ],
+        axis=0,
+    )
+    return t
+
+
+def fit_spline_ridge_dense(
+    x: np.ndarray,
+    y: np.ndarray,
+    t: np.ndarray,
+    p: int,
+    smoothness_coeff: float = 0.0,
+    diff_order: int = 2,
+) -> np.ndarray:
+    """
+    Fit d'un spline B-spline 1D par moindres carrés régularisés (ridge smoothing spline).
+
+    On résout :
+        min_c ||B c - y||^2 + λ ||D c||^2
+
+    où :
+        - B est la matrice de design B-spline
+        - D est une matrice de différences finies d'ordre `diff_order`
+        - λ = smoothness_coeff
+
+    Parameters
+    ----------
+    x : ndarray, shape (n,)
+        Points d'entrée.
+    y : ndarray, shape (n,)
+        Valeurs cibles.
+    t : ndarray
+        Vecteur de knots (clamped).
+    p : int
+        Degré du spline.
+    smoothness_coeff : float
+        Coefficient de régularisation λ.
+    diff_order : int
+        Ordre de la pénalité de différences (1 = pente, 2 = courbure).
+
+    Returns
+    -------
+    c : ndarray, shape (K,)
+        Coefficients du spline.
+    """
+
+    # -----------------------------
+    # Design matrix B
+    # -----------------------------
+    B = build_basis_matrix(x, t, p)  # shape (n, K)
+    n, K = B.shape
+
+    # -----------------------------
+    # Least squares part
+    # -----------------------------
+    BtB = B.T @ B
+    Bty = B.T @ y
+
+    # -----------------------------
+    # Regularization (finite differences)
+    # -----------------------------
+    if smoothness_coeff > 0.0 and diff_order > 0:
+        D = build_finite_difference(K, diff_order)  # shape (K-d, K)
+        DtD = D.T @ D
+        A = BtB + smoothness_coeff * DtD
+    else:
+        A = BtB
+
+    # -----------------------------
+    # Solve linear system
+    # -----------------------------
+    c = np.linalg.solve(A, Bty)
+
+    return c
+
+
+def build_finite_difference(K: int, order: int = 2) -> np.ndarray:
+
+    if order < 1:
+        raise ValueError("order must be >= 1")
+    if order >= K:
+        raise ValueError("order must be < K")
+
+    D = np.zeros((K - order, K))
+
+    if order == 1:
+        for i in range(K - 1):
+            D[i, i] = -1.0
+            D[i, i + 1] = 1.0
+
+    elif order == 2:
+        for i in range(K - 2):
+            D[i, i] = 1.0
+            D[i, i + 1] = -2.0
+            D[i, i + 2] = 1.0
+
+    else:
+        raise NotImplementedError("Only finite difference order 1 or 2 supported")
+
+    return D
+
+
+import numpy as np
+
+
+def build_basis_matrix(
+    x: np.ndarray,
+    t: np.ndarray,
+    p: int,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    n = x.shape[0]
+
+    K = len(t) - p - 1
+    B = np.zeros((n, K), dtype=float)
+
+    for k in range(K):
+        B[:, k] = bspline_basis(k, p, t, x)
+
+    return B
+
+
+def bspline_basis(k: int, p: int, t: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """
+    Évalue la base B-spline B_{k,p}(x) via la récursion de Cox–de Boor.
+    """
+    if p == 0:
+        return np.where((t[k] <= x) & (x < t[k + 1]), 1.0, 0.0)
+
+    denom1 = t[k + p] - t[k]
+    denom2 = t[k + p + 1] - t[k + 1]
+
+    term1 = 0.0
+    term2 = 0.0
+
+    if denom1 > 0:
+        term1 = (x - t[k]) / denom1 * bspline_basis(k, p - 1, t, x)
+
+    if denom2 > 0:
+        term2 = (t[k + p + 1] - x) / denom2 * bspline_basis(k + 1, p - 1, t, x)
+
+    return term1 + term2
