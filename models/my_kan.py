@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.spline import uniform_clamped_knots, bspline_basis_matrix
+from models.spline import uniform_clamped_knots, bspline_basis_matrix
 
 
 class KANLayer(nn.Module):
@@ -364,4 +364,4 @@ def train_kan_from_dataset(
                     f"val_loss={val_loss:.6e} (mse={val_mse:.6e})"
                 )
 
-    return history
+    return model, history

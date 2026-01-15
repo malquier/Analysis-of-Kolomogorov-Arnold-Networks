@@ -1,0 +1,75 @@
+{
+  "dataset": {
+    "n_train": 50000,
+    "n_val": 10000,
+    "k": 120.0,
+    "t": 1.0,
+    "sigma": 0.2,
+    "r": 0.05,
+    "s_min": 50.0,
+    "s_max": 200.0
+  },
+  "training": {
+    "batch_size": 4096,
+    "epochs": 120,
+    "lr": 0.002,
+    "seed": 0
+  },
+  "models": {
+    "my_kan": {
+      "dims": [
+        2,
+        5,
+        5,
+        1
+      ],
+      "p": 3,
+      "n_intervals": 16,
+      "domains": [
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          1.0
+        ]
+      ],
+      "init_scale": 0.01
+    },
+    "py_kan": {
+      "width": [
+        [
+          2,
+          0
+        ],
+        [
+          8,
+          0
+        ],
+        [
+          8,
+          0
+        ],
+        [
+          1,
+          0
+        ]
+      ],
+      "grid": 5,
+      "k": 3,
+      "seed": 0,
+      "device": "cpu"
+    },
+    "mlp": {
+      "in_dim": 2,
+      "hidden": 256,
+      "depth": 3,
+      "act": "tanh"
+    }
+  }
+}

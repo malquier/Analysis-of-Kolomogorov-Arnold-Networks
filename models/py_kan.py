@@ -1,10 +1,8 @@
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
-from typing import Any, Callable, Optional
 from black_scholes import payoff_call, bs_call_price
 import torch
 import torch.nn as nn
-from mpl_toolkits.mplot3d import Axes3D
 from kan import KAN
 
 
