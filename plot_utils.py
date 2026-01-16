@@ -11,22 +11,68 @@ from models.spline import (
     fit_spline_ridge_dense,
 )
 from pathlib import Path
+from get_data import OptionPricingDataset
 import os
 
 
 def plot_loss_histories(
-    histories: Dict[str, Dict[str, List[float]]], output: Path
+    histories: Dict[str, Dict[str, List[float]]],
+    output: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
-    for ax, (name, history) in zip(axes, histories.items()):
-        ax.plot(history["train_loss"], label="Train")
-        ax.plot(history["val_loss"], label="Validation")
+    """
+    Plot des losses pour plusieurs modèles.
+
+    histories: dict {model_name: history_dict}
+    où history_dict contient typiquement:
+      - "train_total"
+      - "train_data"
+      - "train_bs"
+      - "train_bc"
+      - "train_reg"
+      - "val_total"
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    model_names = list(histories.keys())
+    n_models = len(model_names)
+    if n_models == 0:
+        raise ValueError("histories is empty")
+
+    # Une colonne par modèle
+    fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 5), sharey=True)
+    if n_models == 1:
+        axes = [axes]
+
+    # Courbes attendues (ordre d’affichage)
+    keys_to_plot = [
+        ("train_total", "Train total"),
+        ("train_data", "Train data"),
+        ("train_bs", "Train BS(PDE)"),
+        ("train_bc", "Train BC"),
+        ("train_reg", "Train reg"),
+        ("val_total", "Val total"),
+    ]
+
+    for ax, name in zip(axes, model_names):
+        history = histories[name]
+
+        # Plot uniquement les clés présentes
+        plotted_any = False
+        for k, label in keys_to_plot:
+            if k in history and len(history[k]) > 0:
+                ax.plot(history[k], label=label)
+                plotted_any = True
+
+        if not plotted_any:
+            ax.text(0.5, 0.5, "No recognized keys in history", ha="center", va="center")
+
         ax.set_title(name)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("MSE")
+        ax.set_ylabel("Loss")
         ax.set_yscale("log")
         ax.grid(True, which="both")
         ax.legend()
+
     fig.tight_layout()
     fig.savefig(output, dpi=150)
     plt.close(fig)
@@ -35,19 +81,22 @@ def plot_loss_histories(
 def plot_call_curves(
     models: Dict[str, nn.Module],
     *,
-    config: DatasetConfig,
+    config: OptionPricingDataset,
     output: Path,
     device: torch.device,
 ) -> None:
-    spot = torch.linspace(config.s_min, config.s_max, 400, device=device).unsqueeze(1)
+    spot = torch.linspace(
+        min(config.prices) / config.strike,
+        max(config.prices) / config.strike,
+        4000,
+        device=device,
+    ).unsqueeze(1)
     time = torch.zeros_like(spot)
     features = torch.cat([time, spot], dim=1)
-    features_scaled = scale_inputs(
-        features, t=config.t, s_min=config.s_min, s_max=config.s_max
-    )
+    features_scaled = scale_inputs(features, config.maturity)
 
     true_prices = bs_call_price(
-        spot, time, K=config.k, T=config.t, r=config.r, sigma=config.sigma
+        spot, time, K=1, T=config.maturity, r=config.rate, sigma=config.vol
     )
 
     fig, axes = plt.subplots(1, len(models), figsize=(18, 5), sharey=True)

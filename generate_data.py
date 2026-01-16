@@ -18,10 +18,16 @@ class DatasetConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    batch_size: int = 4096
+    batch_size: int = 128
     epochs: int = 120
     lr: float = 2e-3
     seed: int = 0
+    r = 0.02
+    sigma = 0.2
+
+    lambda_bs: float = 1.0
+    lambda_bc: float = 10.0
+    lambda_reg: float = 1e-2
 
 
 class BatchProvider:
@@ -57,6 +63,81 @@ class BatchProvider:
         return batches
 
 
+class PINNBatchProvider:
+    def __init__(
+        self,
+        *,
+        n_batches: int,
+        n_int: int,
+        n_bc: int,
+        S_max: float,
+        T: float,
+        K: float,
+        device: torch.device,
+        seed: int = 0,
+    ) -> None:
+        self.n_batches = n_batches
+        self.n_int = n_int
+        self.n_bc = n_bc
+        self.S_max = S_max
+        self.T = T
+        self.K = K
+        self.device = device
+
+        self.generator = torch.Generator(device=device)
+        self.generator.manual_seed(seed)
+
+        self.batches = self._make_batches()
+
+    def _make_batches(self):
+        batches = []
+        for _ in range(self.n_batches):
+            # Interior: (t, S)
+            S_int = (
+                torch.rand(self.n_int, 1, generator=self.generator, device=self.device)
+                * self.S_max
+            ) / self.K
+            t_int = (
+                torch.rand(self.n_int, 1, generator=self.generator, device=self.device)
+                * self.T
+            )
+            x_int = torch.cat([t_int, S_int], dim=1)  # [t, S]
+
+            # Boundary terminal: t = T, C(S,T)=max(S-K,0)
+            S_T = (
+                torch.rand(self.n_bc, 1, generator=self.generator, device=self.device)
+                * self.S_max
+            ) / self.K
+            t_T = torch.full_like(S_T, self.T)
+            x_bc = torch.cat([t_T, S_T], dim=1)  # [t, S]
+            y_bc = torch.relu(S_T - self.K)
+
+            batches.append({"interior": x_int, "boundary": (x_bc, y_bc)})
+
+        return batches
+
+
+class HybridBatchProvider:
+    def __init__(
+        self,
+        data_batches: list[tuple[torch.Tensor, torch.Tensor]],
+        pinn_provider: PINNBatchProvider,
+    ) -> None:
+        if len(data_batches) != len(pinn_provider.batches):
+            raise ValueError(
+                "data_batches et pinn_batches doivent avoir le même nombre de batches"
+            )
+        self.batches = []
+        for (xb, yb), pb in zip(data_batches, pinn_provider.batches):
+            self.batches.append(
+                {
+                    "data": (xb, yb),
+                    "interior": pb["interior"],
+                    "boundary": pb["boundary"],
+                }
+            )
+
+
 @torch.no_grad()
 def make_simulated_call_data(
     n_samples: int,
@@ -76,11 +157,11 @@ def make_simulated_call_data(
     return features, targets
 
 
-def scale_inputs(
-    X: torch.Tensor, *, t: float, s_min: float, s_max: float
-) -> torch.Tensor:
-    time = X[:, 0:1]
-    spot = X[:, 1:2]
+def scale_inputs(X: torch.Tensor, t: float) -> torch.Tensor:
+    time = X[:, 1:2]
+    spot = X[:, 0:1]
+    s_min = min(spot)
+    s_max = max(spot)
     time_scaled = 2.0 * (time / t) - 1.0
     spot_scaled = 2.0 * (spot - s_min) / (s_max - s_min) - 1.0
     return torch.cat([time_scaled, spot_scaled], dim=1)
